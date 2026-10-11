@@ -1,4 +1,4 @@
-// Typed fetch layer. Every number shown in the UI comes from one of these calls; there are no mocked responses.
+﻿// Typed fetch layer. Every number shown in the UI comes from one of these calls; there are no mocked responses.
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export class ApiError extends Error {
@@ -14,6 +14,7 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
   let res: Response;
   try {
     res = await fetch(`${BASE}/api${path}`, {
+      credentials: "include",
       method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
       headers: opts.body !== undefined ? { "Content-Type": "application/json" } : undefined,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -68,6 +69,6 @@ export function useAction<A extends any[], T>(fn: (...a: A) => Promise<T>) {
   return { data, error, loading, run, reset: () => { setData(null); setError(null); } };
 }
 
-export const pct = (x: number | null | undefined, d = 1) => (x == null ? "—" : `${(x * 100).toFixed(d)}%`);
-export const f3 = (x: number | null | undefined) => (x == null ? "—" : x.toFixed(3));
+export const pct = (x: number | null | undefined, d = 1) => (x == null ? "â€”" : `${(x * 100).toFixed(d)}%`);
+export const f3 = (x: number | null | undefined) => (x == null ? "â€”" : x.toFixed(3));
 export const fmtDate = (s: string) => new Date(s).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });

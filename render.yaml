@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: cardiosage
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    disk:
+      name: cardiosage-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: CARDIOSAGE_DB
+        value: /var/data/cardiosage.db
+      - key: CARDIOSAGE_COOKIE_SECURE
+        value: "true"
+      - key: CARDIOSAGE_ADMIN_EMAIL
+        sync: false
+      - key: CARDIOSAGE_ADMIN_PASSWORD
+        sync: false

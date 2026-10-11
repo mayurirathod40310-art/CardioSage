@@ -18,6 +18,7 @@ _lock = threading.Lock()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS predictions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   model_version TEXT NOT NULL,
   algorithm TEXT NOT NULL,
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS predictions (
 CREATE INDEX IF NOT EXISTS idx_pred_created ON predictions(created_at);
 CREATE TABLE IF NOT EXISTS experiments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   created_at TEXT NOT NULL,
   kind TEXT NOT NULL,
   model_version TEXT,
@@ -61,6 +63,10 @@ def conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with conn() as c:
         c.executescript(SCHEMA)
+        for table in ("predictions", "experiments"):
+            columns = {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}
+            if "user_id" not in columns:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER REFERENCES users(id)")
 
 
 def _pred_row(r: sqlite3.Row) -> dict[str, Any]:
@@ -72,13 +78,13 @@ def _pred_row(r: sqlite3.Row) -> dict[str, Any]:
 
 
 def add_prediction(model_version: str, algorithm: str, inputs: dict, predicted_class: int, p1: float,
-                   top_features: list | None, source: str = "prediction") -> int:
+                   top_features: list | None, source: str = "prediction", user_id: int | None = None) -> int:
     with conn() as c:
         cur = c.execute(
-            "INSERT INTO predictions (created_at, model_version, algorithm, inputs_json, predicted_class, probability_class1, top_features_json, source) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO predictions (created_at, model_version, algorithm, inputs_json, predicted_class, probability_class1, top_features_json, source, user_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (now(), model_version, algorithm, json.dumps(inputs), int(predicted_class), float(p1),
-             json.dumps(top_features or []), source))
+             json.dumps(top_features or []), source, user_id))
         return int(cur.lastrowid)
 
 
@@ -87,8 +93,10 @@ _SORTS = {"created_at": "created_at", "probability": "probability_class1", "id":
 
 def list_predictions(limit: int = 50, offset: int = 0, predicted_class: int | None = None, algorithm: str | None = None,
                      model_version: str | None = None, source: str | None = None, min_p: float | None = None,
-                     max_p: float | None = None, sort: str = "created_at", order: str = "desc") -> dict[str, Any]:
+                     max_p: float | None = None, sort: str = "created_at", order: str = "desc",
+                     user_id: int | None = None) -> dict[str, Any]:
     where, args = [], []
+    if user_id is not None: where.append("user_id=?"); args.append(user_id)
     if predicted_class is not None: where.append("predicted_class=?"); args.append(predicted_class)
     if algorithm: where.append("algorithm=?"); args.append(algorithm)
     if model_version: where.append("model_version=?"); args.append(model_version)
@@ -105,33 +113,49 @@ def list_predictions(limit: int = 50, offset: int = 0, predicted_class: int | No
     return {"total": total, "items": [_pred_row(r) for r in rows]}
 
 
-def get_prediction(pid: int) -> dict[str, Any] | None:
+def get_prediction(pid: int, user_id: int | None = None) -> dict[str, Any] | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM predictions WHERE id=?", (pid,)).fetchone()
+        if user_id is None:
+            r = c.execute("SELECT * FROM predictions WHERE id=?", (pid,)).fetchone()
+        else:
+            r = c.execute("SELECT * FROM predictions WHERE id=? AND user_id=?", (pid, user_id)).fetchone()
     return _pred_row(r) if r else None
 
 
-def delete_prediction(pid: int) -> bool:
+def delete_prediction(pid: int, user_id: int | None = None) -> bool:
     with conn() as c:
-        return c.execute("DELETE FROM predictions WHERE id=?", (pid,)).rowcount > 0
+        if user_id is None:
+            cur = c.execute("DELETE FROM predictions WHERE id=?", (pid,))
+        else:
+            cur = c.execute("DELETE FROM predictions WHERE id=? AND user_id=?", (pid, user_id))
+        return cur.rowcount > 0
 
 
-def delete_all_predictions() -> int:
+def delete_all_predictions(user_id: int | None = None) -> int:
     with conn() as c:
-        return c.execute("DELETE FROM predictions").rowcount
+        if user_id is None:
+            cur = c.execute("DELETE FROM predictions")
+        else:
+            cur = c.execute("DELETE FROM predictions WHERE user_id=?", (user_id,))
+        return cur.rowcount
 
 
-def prediction_stats() -> dict[str, Any]:
+def prediction_stats(user_id: int | None = None) -> dict[str, Any]:
     with conn() as c:
-        total = c.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
-        by = c.execute("SELECT predicted_class, COUNT(*) n FROM predictions GROUP BY predicted_class").fetchall()
+        if user_id is None:
+            total = c.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+            by = c.execute("SELECT predicted_class, COUNT(*) n FROM predictions GROUP BY predicted_class").fetchall()
+        else:
+            total = c.execute("SELECT COUNT(*) FROM predictions WHERE user_id=?", (user_id,)).fetchone()[0]
+            by = c.execute("SELECT predicted_class, COUNT(*) n FROM predictions WHERE user_id=? GROUP BY predicted_class", (user_id,)).fetchall()
     return {"total": total, "by_class": {int(r["predicted_class"]): r["n"] for r in by}}
 
 
-def add_experiment(kind: str, title: str, summary: dict, model_version: str | None = None, config_: dict | None = None) -> int:
+def add_experiment(kind: str, title: str, summary: dict, model_version: str | None = None,
+                   config_: dict | None = None, user_id: int | None = None) -> int:
     with conn() as c:
-        cur = c.execute("INSERT INTO experiments (created_at, kind, model_version, title, summary_json, config_json) VALUES (?,?,?,?,?,?)",
-                        (now(), kind, model_version, title, json.dumps(summary), json.dumps(config_ or {})))
+        cur = c.execute("INSERT INTO experiments (created_at, kind, model_version, title, summary_json, config_json, user_id) VALUES (?,?,?,?,?,?,?)",
+                        (now(), kind, model_version, title, json.dumps(summary), json.dumps(config_ or {}), user_id))
         return int(cur.lastrowid)
 
 
@@ -140,8 +164,12 @@ def _exp_row(r: sqlite3.Row) -> dict[str, Any]:
             "title": r["title"], "summary": json.loads(r["summary_json"]), "config": json.loads(r["config_json"] or "{}")}
 
 
-def list_experiments(limit: int = 50, offset: int = 0, kind: str | None = None, order: str = "desc") -> dict[str, Any]:
-    w, args = ("WHERE kind=?", [kind]) if kind else ("", [])
+def list_experiments(limit: int = 50, offset: int = 0, kind: str | None = None, order: str = "desc",
+                     user_id: int | None = None) -> dict[str, Any]:
+    conditions, args = [], []
+    if kind: conditions.append("kind=?"); args.append(kind)
+    if user_id is not None: conditions.append("user_id=?"); args.append(user_id)
+    w = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     direction = "ASC" if order.lower() == "asc" else "DESC"
     with conn() as c:
         total = c.execute(f"SELECT COUNT(*) FROM experiments {w}", args).fetchone()[0]
@@ -150,12 +178,19 @@ def list_experiments(limit: int = 50, offset: int = 0, kind: str | None = None, 
     return {"total": total, "items": [_exp_row(r) for r in rows]}
 
 
-def get_experiment(eid: int) -> dict[str, Any] | None:
+def get_experiment(eid: int, user_id: int | None = None) -> dict[str, Any] | None:
     with conn() as c:
-        r = c.execute("SELECT * FROM experiments WHERE id=?", (eid,)).fetchone()
+        if user_id is None:
+            r = c.execute("SELECT * FROM experiments WHERE id=?", (eid,)).fetchone()
+        else:
+            r = c.execute("SELECT * FROM experiments WHERE id=? AND user_id=?", (eid, user_id)).fetchone()
     return _exp_row(r) if r else None
 
 
-def delete_experiment(eid: int) -> bool:
+def delete_experiment(eid: int, user_id: int | None = None) -> bool:
     with conn() as c:
-        return c.execute("DELETE FROM experiments WHERE id=?", (eid,)).rowcount > 0
+        if user_id is None:
+            cur = c.execute("DELETE FROM experiments WHERE id=?", (eid,))
+        else:
+            cur = c.execute("DELETE FROM experiments WHERE id=? AND user_id=?", (eid, user_id))
+        return cur.rowcount > 0

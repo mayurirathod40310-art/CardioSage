@@ -1,18 +1,19 @@
 """CardioSage REST API (FastAPI). Run: uvicorn cardiosage.main:app --port 8000   Docs at /docs"""
 from __future__ import annotations
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, config, counterfactual, data, db, scenario, store, training
+from . import __version__, auth, config, counterfactual, data, db, scenario, store, training
 from .explain import explain_instance
 from .schema import CLASS_LABELS, FEATURE_BY_NAME, FEATURES, FEATURE_NAMES
 from .store import NoModelError
@@ -23,16 +24,110 @@ STARTED = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    auth.init_auth_db()
+    auth.bootstrap_admin_from_env()
     yield
 
 
 app = FastAPI(title="CardioSage API", version=__version__, lifespan=lifespan,
               description="Explainable heart-disease modelling with counterfactual analysis. Research/education software, "
                           "NOT a medical device. Predictions are model outputs, not diagnoses.")
-app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+
+
+# ---------------------------------------------------------------- authentication
+class AuthCredentials(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class RegisterCredentials(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=12, max_length=128)
+
+
+def _cookie_secure() -> bool:
+    """Production deployments must set CARDIOSAGE_COOKIE_SECURE=true."""
+    return os.environ.get("CARDIOSAGE_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=auth.SESSION_COOKIE,
+        value=token,
+        max_age=auth.SESSION_DAYS * 24 * 60 * 60,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(credentials: RegisterCredentials):
+    try:
+        user = auth.create_user(credentials.email, credentials.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"user": user}
+
+
+@app.post("/api/auth/login")
+def login(credentials: AuthCredentials, response: Response):
+    user = auth.authenticate(credentials.email, credentials.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token, _expires = auth.create_session(user["id"])
+    _set_session_cookie(response, token)
+    return {"user": user}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE))
+    response.delete_cookie(
+        key=auth.SESSION_COOKIE,
+        path="/",
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+    )
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def current_user(request: Request):
+    user = auth.get_session_user(request.cookies.get(auth.SESSION_COOKIE))
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return {"user": user}
 
 
 # ---------------------------------------------------------------- errors
+def _session_user(request: Request):
+    return auth.get_session_user(request.cookies.get(auth.SESSION_COOKIE))
+
+
+def _require_user(request: Request):
+    user = _session_user(request)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "authentication_required", "message": "Please sign in to save data or access history."},
+        )
+    return user
+
+
+def _require_admin(request: Request):
+    user = _require_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "admin_required", "message": "Administrator access is required."},
+        )
+    return user
+
+
 @app.exception_handler(NoModelError)
 async def _no_model(_: Request, exc: NoModelError):
     return JSONResponse(status_code=409, content={"detail": {"code": "model_not_trained", "message": str(exc)}})
@@ -160,12 +255,16 @@ def health():
 
 
 @app.get("/api/overview", tags=["system"])
-def overview():
+def overview(request: Request):
     prof = data.cached_profile()
     v = store.current_version()
+    user = _session_user(request)
+    # Never expose another account's saved activity to guests or other users.
+    owner_id = user["id"] if user is not None else -1
     out: dict[str, Any] = {"health": health(), "dataset": {k: prof[k] for k in ("shape", "class_distribution", "source")},
                            "warnings": prof["warnings"], "label_direction": prof["label_direction"],
-                           "recent_experiments": db.list_experiments(limit=5)["items"], "prediction_stats": db.prediction_stats()}
+                           "recent_experiments": db.list_experiments(limit=5, user_id=owner_id)["items"],
+                           "prediction_stats": db.prediction_stats(user_id=owner_id)}
     if v:
         b = _bundle()
         out["model"] = {"version": b.version, "selected": b.selected, "created_at": b.meta["created_at"], "split": b.meta["split"],
@@ -213,7 +312,8 @@ def model_versions():
 
 
 @app.post("/api/models/versions/{version}/activate", tags=["models"])
-def activate_version(version: str):
+def activate_version(request: Request, version: str):
+    _require_admin(request)
     try:
         store.set_current(version)
     except KeyError as e:
@@ -246,11 +346,12 @@ def _run_training(seed: int) -> None:
 
 
 @app.post("/api/train", status_code=202, tags=["models"])
-def train(req: TrainRequest = TrainRequest()):
+def train(request: Request, req: TrainRequest = TrainRequest()):
     """Start a background training run (about a minute). Poll GET /api/train/status."""
     with _train_lock:
         if _train_state["status"] == "running":
             raise HTTPException(409, {"code": "training_in_progress", "message": "A training run is already in progress."})
+        _require_admin(request)
         _train_state.update(status="running", message="Starting", progress=0.0, version=None, error=None, started_at=time.time())
     threading.Thread(target=_run_training, args=(req.seed,), daemon=True).start()
     return _train_state.copy()
@@ -263,7 +364,7 @@ def train_status():
 
 # ---------------------------------------------------------------- prediction
 @app.post("/api/predict", tags=["prediction"])
-def predict(req: PredictRequest):
+def predict(req: PredictRequest, request: Request):
     b = _bundle()
     algo = _algo(b, req.algorithm)
     row = req.features.model_dump()
@@ -279,9 +380,9 @@ def predict(req: PredictRequest):
     }
     if req.explain:
         out["explanation"] = explain_instance(b, row, algo)
-    if req.save:
+    if req.save and (user := _session_user(request)) is not None:
         top = [{"feature": c["feature"], "contribution": round(c["contribution"], 4)} for c in (out["explanation"] or {}).get("contributions", [])[:5]]
-        out["saved_id"] = db.add_prediction(b.version, algo, row, pred["predicted_class"], pred["probability_class1"], top)
+        out["saved_id"] = db.add_prediction(b.version, algo, row, pred["predicted_class"], pred["probability_class1"], top, user_id=user["id"])
     return out
 
 
@@ -318,7 +419,7 @@ def explain_global(algorithm: Optional[str] = None):
 
 # ---------------------------------------------------------------- counterfactual + scenarios
 @app.post("/api/counterfactual", tags=["counterfactual"])
-def counterfactual_endpoint(req: CounterfactualRequest):
+def counterfactual_endpoint(req: CounterfactualRequest, request: Request):
     b = _bundle()
     algo = _algo(b, req.algorithm)
     row = req.features.model_dump()
@@ -328,30 +429,30 @@ def counterfactual_endpoint(req: CounterfactualRequest):
     t = time.time()
     res = counterfactual.generate(b, row, algo, req.desired_class, req.locked_features, req.max_changes, req.n_results, req.margin)
     res.update(input=row, model_version=b.version, warnings=_input_warnings(b, row), seconds=round(time.time() - t, 2))
-    if req.save:
+    if req.save and (user := _session_user(request)) is not None:
         res["experiment_id"] = db.add_experiment(
             "counterfactual", f"Counterfactual search ({res['original']['predicted_class']}→{res['desired_class']}): "
             f"{'found ' + str(len(res['candidates'])) if res['found'] else 'none found'}",
             {"found": res["found"], "n_candidates": len(res["candidates"]), "evaluated": res["evaluated"],
              "best": res["candidates"][0]["changes"] if res["candidates"] else None, "input": row,
              "original_probability": res["original"]["probability_class1"]},
-            model_version=b.version, config_={"algorithm": algo, "locked": req.locked_features, "max_changes": req.max_changes, "margin": req.margin})
+            model_version=b.version, config_={"algorithm": algo, "locked": req.locked_features, "max_changes": req.max_changes, "margin": req.margin}, user_id=user["id"])
     return res
 
 
 @app.post("/api/scenarios/compare", tags=["scenarios"])
-def scenarios_compare(req: ScenarioRequest):
+def scenarios_compare(req: ScenarioRequest, request: Request):
     b = _bundle()
     algo = _algo(b, req.algorithm)
     a, s = req.baseline.model_dump(), req.scenario.model_dump()
     res = scenario.compare(b, a, s, algo)
     res.update(model_version=b.version, warnings=_input_warnings(b, s), baseline=a, scenario=s)
-    if req.save:
+    if req.save and (user := _session_user(request)) is not None:
         res["experiment_id"] = db.add_experiment(
             "scenario", f"What-if: {len(res['changed_features'])} change(s), Δp(target=1) = {res['probability_difference']:+.3f}",
             {"changes": res["changes"], "a": {k: res["a"][k] for k in ("predicted_class", "probability_class1")},
              "b": {k: res["b"][k] for k in ("predicted_class", "probability_class1")}, "class_flipped": res["class_flipped"],
-             "baseline": a, "scenario": s}, model_version=b.version, config_={"algorithm": algo})
+             "baseline": a, "scenario": s}, model_version=b.version, config_={"algorithm": algo}, user_id=user["id"])
     return res
 
 
@@ -390,60 +491,67 @@ def reliability(algorithm: Optional[str] = None):
 
 # ---------------------------------------------------------------- history
 @app.get("/api/history/predictions", tags=["history"])
-def history_predictions(limit: int = Query(25, ge=1, le=200), offset: int = Query(0, ge=0), predicted_class: Optional[Literal[0, 1]] = None,
+def history_predictions(request: Request, limit: int = Query(25, ge=1, le=200), offset: int = Query(0, ge=0), predicted_class: Optional[Literal[0, 1]] = None,
                         algorithm: Optional[str] = None, model_version: Optional[str] = None, min_probability: Optional[float] = Query(None, ge=0, le=1),
                         max_probability: Optional[float] = Query(None, ge=0, le=1), sort: Literal["created_at", "probability", "id", "algorithm"] = "created_at",
                         order: Literal["asc", "desc"] = "desc"):
-    return db.list_predictions(limit, offset, predicted_class, algorithm, model_version, None, min_probability, max_probability, sort, order)
+    user = _require_user(request)
+    return db.list_predictions(limit, offset, predicted_class, algorithm, model_version, None, min_probability, max_probability, sort, order, user_id=user["id"])
 
 
 @app.get("/api/history/predictions/{pid}", tags=["history"])
-def history_prediction(pid: int):
-    r = db.get_prediction(pid)
+def history_prediction(request: Request, pid: int):
+    user = _require_user(request)
+    r = db.get_prediction(pid, user_id=user["id"])
     if not r:
         raise HTTPException(404, {"code": "not_found", "message": f"Prediction {pid} not found."})
     return r
 
 
 @app.delete("/api/history/predictions/{pid}", tags=["history"])
-def history_prediction_delete(pid: int):
-    if not db.delete_prediction(pid):
+def history_prediction_delete(request: Request, pid: int):
+    user = _require_user(request)
+    if not db.delete_prediction(pid, user_id=user["id"]):
         raise HTTPException(404, {"code": "not_found", "message": f"Prediction {pid} not found."})
     return {"deleted": pid}
 
 
 @app.delete("/api/history/predictions", tags=["history"])
-def history_predictions_clear():
-    return {"deleted": db.delete_all_predictions()}
+def history_predictions_clear(request: Request):
+    user = _require_user(request)
+    return {"deleted": db.delete_all_predictions(user_id=user["id"])}
 
 
 @app.get("/api/history/experiments", tags=["history"])
-def history_experiments(limit: int = Query(25, ge=1, le=200), offset: int = Query(0, ge=0),
+def history_experiments(request: Request, limit: int = Query(25, ge=1, le=200), offset: int = Query(0, ge=0),
                         kind: Optional[Literal["training", "counterfactual", "scenario"]] = None, order: Literal["asc", "desc"] = "desc"):
-    return db.list_experiments(limit, offset, kind, order)
+    user = _require_user(request)
+    return db.list_experiments(limit, offset, kind, order, user_id=user["id"])
 
 
 @app.get("/api/history/experiments/{eid}", tags=["history"])
-def history_experiment(eid: int):
-    r = db.get_experiment(eid)
+def history_experiment(request: Request, eid: int):
+    user = _require_user(request)
+    r = db.get_experiment(eid, user_id=user["id"])
     if not r:
         raise HTTPException(404, {"code": "not_found", "message": f"Experiment {eid} not found."})
     return r
 
 
 @app.delete("/api/history/experiments/{eid}", tags=["history"])
-def history_experiment_delete(eid: int):
-    if not db.delete_experiment(eid):
+def history_experiment_delete(request: Request, eid: int):
+    user = _require_user(request)
+    if not db.delete_experiment(eid, user_id=user["id"]):
         raise HTTPException(404, {"code": "not_found", "message": f"Experiment {eid} not found."})
     return {"deleted": eid}
 
 
 @app.get("/api/privacy", tags=["history"])
 def privacy():
-    return {"stored_locally_in": str(config.DB_PATH),
+    return {"storage": "Stored in the server-side database; saved predictions and experiments are scoped to the account that created them.",
             "prediction_fields": ["timestamp", "model version", "algorithm", "the 13 submitted feature values", "predicted class", "probability", "top 5 contributing features"],
-            "not_stored": ["names", "identifiers", "free text", "IP addresses", "device information"],
-            "deletion": "Delete single entries or all entries from the History page, or via DELETE /api/history/predictions[/{id}]. Deleting storage/cardiosage.db removes everything."}
+            "not_stored_by_application": ["patient names", "patient identifiers", "free text fields"],
+            "deletion": "Sign in to delete your own history from the History page or through the history DELETE endpoints. Server operators may still control database backups and hosting logs."}
 
 
 # ---------------------------------------------------------------- static frontend (production build)

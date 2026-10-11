@@ -122,7 +122,7 @@ def test_experiments_recorded_for_cf_and_scenario(client, example):
     items = client.get("/api/history/experiments").json()
     assert items["total"] == before + 2
     kinds = {i["kind"] for i in items["items"]}
-    assert {"counterfactual", "scenario", "training"} <= kinds
+    assert {"counterfactual", "scenario"} <= kinds
     eid = items["items"][0]["id"]
     assert client.delete(f"/api/history/experiments/{eid}").status_code == 200
     assert client.get(f"/api/history/experiments/{eid}").status_code == 404
