@@ -7,7 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DATA_PATH = Path(os.environ.get("CARDIOSAGE_DATA", ROOT / "data" / "heart.csv"))
 MODELS_DIR = Path(os.environ.get("CARDIOSAGE_MODELS", ROOT / "models"))
-DB_PATH = Path(os.environ.get("CARDIOSAGE_DB", ROOT / "storage" / "cardiosage.db"))
+_DEFAULT_DB_PATH = Path("/tmp/cardiosage.db") if os.environ.get("VERCEL") == "1" else ROOT / "storage" / "cardiosage.db"
+DB_PATH = Path(os.environ.get("CARDIOSAGE_DB", _DEFAULT_DB_PATH))
 FRONTEND_DIST = Path(os.environ.get("CARDIOSAGE_FRONTEND", ROOT / "frontend" / "dist"))
 
 RANDOM_STATE = 42

@@ -48,7 +48,8 @@ class RegisterCredentials(BaseModel):
 
 def _cookie_secure() -> bool:
     """Production deployments must set CARDIOSAGE_COOKIE_SECURE=true."""
-    return os.environ.get("CARDIOSAGE_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes"}
+    default_secure = "true" if os.environ.get("VERCEL") == "1" else "false"
+    return os.environ.get("CARDIOSAGE_COOKIE_SECURE", default_secure).strip().lower() in {"1", "true", "yes"}
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
