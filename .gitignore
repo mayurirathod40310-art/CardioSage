@@ -1,0 +1,17 @@
+# environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+.vite/
+# secrets
+.env
+.env.*
+# generated artefacts (recreated by run.ps1 / training)
+frontend/dist/
+storage/
+*.log
+.run/
+setup.ps1.bak
